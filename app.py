@@ -1,12 +1,9 @@
 import re
-from io import StringIO
 from pathlib import Path
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Enhancement Ratio Analyzer", layout="wide")
@@ -14,19 +11,56 @@ st.set_page_config(page_title="Enhancement Ratio Analyzer", layout="wide")
 # -------------------------------------------------
 # Session state
 # -------------------------------------------------
-if "er_results_ready" not in st.session_state:
-    st.session_state.er_results_ready = False
-if "er_summary_df" not in st.session_state:
-    st.session_state.er_summary_df = pd.DataFrame()
-if "er_review_df" not in st.session_state:
-    st.session_state.er_review_df = pd.DataFrame()
-if "er_warnings_df" not in st.session_state:
-    st.session_state.er_warnings_df = pd.DataFrame()
-if "er_details" not in st.session_state:
-    st.session_state.er_details = {}
-if "er_thickness_editor_df" not in st.session_state:
-    st.session_state.er_thickness_editor_df = pd.DataFrame()
+def init_session_state():
+    defaults = {
+        "er_results_ready": False,
+        "er_summary_df": pd.DataFrame(),
+        "er_review_df": pd.DataFrame(),
+        "er_warnings_df": pd.DataFrame(),
+        "er_details": {},
+        "er_thickness_editor_df": pd.DataFrame(),
+        "er_uploader_key_counter": 0,
+        "er_thickness_csv_key_counter": 0,
+        "er_reference_keywords_text": "REF, REFERENCE, BLANK, CONTROL",
+        "er_last_reference_keywords_text": "REF, REFERENCE, BLANK, CONTROL",
+        "er_last_matching_mode": "Smart mode",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
+
+def reset_app_state():
+    """Reset uploaded files, optional CSV, editor tables, results, warnings, and graph widgets."""
+    st.session_state.er_results_ready = False
+    st.session_state.er_summary_df = pd.DataFrame()
+    st.session_state.er_review_df = pd.DataFrame()
+    st.session_state.er_warnings_df = pd.DataFrame()
+    st.session_state.er_details = {}
+    st.session_state.er_thickness_editor_df = pd.DataFrame()
+    st.session_state.er_uploader_key_counter += 1
+    st.session_state.er_thickness_csv_key_counter += 1
+
+    keys_to_delete = [
+        "er_data_editor",
+        "er_graph_multiselect",
+        "er_graph_mode",
+        "er_manual_y_axis",
+        "er_x_min",
+        "er_x_max",
+        "er_y_min",
+        "er_y_max",
+        "er_sim_x_min",
+        "er_sim_x_max",
+        "er_sim_y_min",
+        "er_sim_y_max",
+    ]
+    for key in keys_to_delete:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+init_session_state()
 
 # -------------------------------------------------
 # Helpers
@@ -46,22 +80,57 @@ def calculate_wavelengths(channels, center_wavelength=550, grating_number=1):
 
 
 def normalize_name(name: str) -> str:
-    stem = Path(name).stem.upper().strip()
+    stem = Path(str(name)).stem.upper().strip()
     stem = re.sub(r"\s+", " ", stem)
     return stem
 
 
-def detect_is_reference(name: str) -> bool:
+def split_name_tokens(name: str):
+    return [token for token in re.split(r"[-_ .]+", normalize_name(name)) if token]
+
+
+def parse_reference_keywords(reference_keywords_text: str):
+    keywords = [
+        normalize_name(k)
+        for k in str(reference_keywords_text).split(",")
+        if str(k).strip()
+    ]
+    return keywords or ["REF"]
+
+
+def detect_is_reference(name: str, reference_keywords=None) -> bool:
+    """
+    Safer reference detection.
+    Short keywords such as REF must match a filename token.
+    Longer custom keywords can also match as substrings.
+    """
+    reference_keywords = reference_keywords or ["REF"]
     n = normalize_name(name)
-    return "REF" in n
+    tokens = split_name_tokens(name)
+
+    for keyword in reference_keywords:
+        keyword_norm = normalize_name(keyword)
+        if keyword_norm in tokens:
+            return True
+        if len(keyword_norm) > 3 and keyword_norm in n:
+            return True
+    return False
 
 
 def detect_material_family(name: str):
     n = normalize_name(name)
+    tokens = split_name_tokens(name)
     ordered = ["PMMA", "EMA", "PET", "PE", "LAM"]
+
+    for fam in ordered:
+        if fam in tokens:
+            return fam
+
+    # Fallback for compact names like PETREF or PMMAREF.
     for fam in ordered:
         if fam in n:
             return fam
+
     return None
 
 
@@ -81,7 +150,7 @@ def extract_thickness_from_name(sample_name: str):
             val = int(part)
             if val in wet_to_dry:
                 return wet_to_dry[val], f"inferred_from_name({val})"
-    return None, "missing"
+    return np.nan, "missing"
 
 
 def match_reference(sample_name: str, available_references: list[str]):
@@ -91,46 +160,67 @@ def match_reference(sample_name: str, available_references: list[str]):
     if not available_references:
         return None, "no_references_uploaded"
 
-    # 1. same family + REF
+    # 1. Same material family.
     if family is not None:
-        family_matches = [r for r in available_references if family in normalize_name(r)]
+        family_matches = [r for r in available_references if detect_material_family(r) == family]
         if len(family_matches) == 1:
             return family_matches[0], f"matched_family:{family}"
         if len(family_matches) > 1:
-            # prefer A if present
             a_matches = [r for r in family_matches if normalize_name(r).endswith(" A")]
             if len(a_matches) == 1:
                 return a_matches[0], f"matched_family_prefer_A:{family}"
             return family_matches[0], f"multiple_family_matches:{family}"
 
-    # 2. fallback generic LAM / PET style refs
+    # 2. Generic fallback.
     generic_priority = ["LAM", "PET", "EMA", "PMMA", "PE"]
     for fam in generic_priority:
-        fam_matches = [r for r in available_references if fam in normalize_name(r)]
+        fam_matches = [r for r in available_references if detect_material_family(r) == fam]
         if len(fam_matches) == 1:
             return fam_matches[0], f"fallback_family:{fam}"
         if len(fam_matches) > 1:
             return fam_matches[0], f"fallback_multiple_family:{fam}"
 
-    # 3. final fallback first ref
+    # 3. Final fallback.
     return available_references[0], "fallback_first_reference"
 
 
-def build_review_table(measurement_files, manual_thickness_map=None):
+def safe_float_or_nan(value):
+    if value is None:
+        return np.nan
+    if isinstance(value, str) and not value.strip():
+        return np.nan
+    try:
+        if pd.isna(value):
+            return np.nan
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        return np.nan
+
+
+def build_review_table(measurement_files, manual_thickness_map=None, reference_keywords=None):
     manual_thickness_map = manual_thickness_map or {}
+    reference_keywords = reference_keywords or ["REF"]
     rows = []
 
     uploaded_names = [extract_sample_name(f.name) for f in measurement_files]
-    ref_names = [n for n in uploaded_names if detect_is_reference(n)]
+    ref_names = [n for n in uploaded_names if detect_is_reference(n, reference_keywords)]
 
     for f in measurement_files:
         parsed_name = extract_sample_name(f.name)
-        is_ref = detect_is_reference(parsed_name)
+        is_ref = detect_is_reference(parsed_name, reference_keywords)
         family = detect_material_family(parsed_name)
-        matched_ref, match_reason = (parsed_name, "self_reference") if is_ref else match_reference(parsed_name, ref_names)
+        matched_ref, match_reason = (
+            (parsed_name, "self_reference")
+            if is_ref
+            else match_reference(parsed_name, ref_names)
+        )
 
-        if parsed_name in manual_thickness_map and manual_thickness_map[parsed_name] not in [None, "", np.nan]:
-            thickness = float(manual_thickness_map[parsed_name])
+        manual_thickness = manual_thickness_map.get(parsed_name)
+        if manual_thickness is not None and not pd.isna(manual_thickness):
+            thickness = float(manual_thickness)
             thickness_source = "manual_upload"
         else:
             thickness, thickness_source = extract_thickness_from_name(parsed_name)
@@ -147,17 +237,18 @@ def build_review_table(measurement_files, manual_thickness_map=None):
         })
 
     return pd.DataFrame(rows)
+
+
 def build_manual_review_table(measurement_files, manual_thickness_map=None):
     manual_thickness_map = manual_thickness_map or {}
     rows = []
 
-    parsed_names = [extract_sample_name(f.name) for f in measurement_files]
-
     for f in measurement_files:
         parsed_name = extract_sample_name(f.name)
+        manual_thickness = manual_thickness_map.get(parsed_name)
 
-        if parsed_name in manual_thickness_map and manual_thickness_map[parsed_name] not in [None, "", np.nan]:
-            thickness = float(manual_thickness_map[parsed_name])
+        if manual_thickness is not None and not pd.isna(manual_thickness):
+            thickness = float(manual_thickness)
             thickness_source = "manual_upload"
         else:
             thickness, thickness_source = extract_thickness_from_name(parsed_name)
@@ -174,44 +265,6 @@ def build_manual_review_table(measurement_files, manual_thickness_map=None):
         })
 
     return pd.DataFrame(rows)
-
-def build_thickness_map_from_editor(df_editor: pd.DataFrame):
-    out = {}
-    if df_editor is None or df_editor.empty:
-        return out
-    for _, row in df_editor.iterrows():
-        name = row.get("Parsed name")
-        thickness = row.get("Thickness (µm)")
-        if pd.notna(name) and pd.notna(thickness):
-            out[str(name)] = float(thickness)
-    return out
-
-
-def select_measurement_files(review_df: pd.DataFrame):
-    if review_df.empty:
-        return [], []
-    refs = review_df[review_df["Type"] == "Reference"]["Parsed name"].tolist()
-    samples = review_df[review_df["Type"] == "Sample"]["Parsed name"].tolist()
-    return refs, samples
-
-
-def plot_enhancement_ratio(ax, wl, ratio, sample_name, thickness=None):
-    label = f"{sample_name} / {thickness:.1f} µm" if thickness is not None and pd.notna(thickness) else sample_name
-    ax.plot(wl, ratio, label=label, lw=2)
-    ax.hlines(y=1, xmin=350, xmax=950, colors="black", linestyles="-", lw=1.5)
-    ax.set_xlim(360, 770)
-    ax.set_xlabel("Wavelength (nm)")
-    ax.set_ylabel("Transmission normalized")
-    ax.grid(True, alpha=0.2)
-
-
-def plot_raw_data(ax, wl, sample_i, ref_i, ref_name, sample_name):
-    ax.plot(wl, sample_i, label=sample_name, lw=1)
-    ax.plot(wl, ref_i, label=ref_name, lw=1)
-    ax.set_xlim(360, 770)
-    ax.set_xlabel("Wavelength (nm)")
-    ax.set_ylabel("Intensity")
-    ax.grid(True, alpha=0.2)
 
 
 def make_downloadable_summary(results_long: pd.DataFrame):
@@ -252,9 +305,6 @@ def parse_thickness_csv(uploaded_file):
     }
 
 
-# -------------------------------------------------
-# UI
-# -------------------------------------------------
 def make_sample_label(sample_name, thickness=None, ref_name=None):
     label = sample_name
     if thickness is not None and pd.notna(thickness):
@@ -270,8 +320,11 @@ def build_plotly_figure(
     mode="ratio",
     d_ref=None,
     x_range=None,
+    y_range=None,
 ):
     fig = go.Figure()
+    title = "Graph"
+    y_label = "Value"
 
     for sample_name in selected_samples:
         d = details_dict[sample_name]
@@ -280,9 +333,7 @@ def build_plotly_figure(
             y = d["ratio"]
             y_label = "Transmission normalized"
             title = "Enhancement ratio"
-            trace_label = make_sample_label(
-                d["sample_name"], d["thickness"], d["ref_name"]
-            )
+            trace_label = make_sample_label(d["sample_name"], d["thickness"], d["ref_name"])
 
         elif mode == "raw_sample":
             y = d["sample_i"]
@@ -327,13 +378,76 @@ def build_plotly_figure(
         legend_title="Samples",
     )
 
-    if x_range is not None:
-        fig.update_xaxes(range=x_range)
-    else:
-        fig.update_xaxes(range=[360, 770])
+    fig.update_xaxes(range=x_range if x_range is not None else [360, 770])
+    if y_range is not None:
+        fig.update_yaxes(range=y_range)
 
     return fig
 
+
+def build_simulation_figure(simulation, x_range=None, y_range=None):
+    fig = go.Figure()
+    wl = simulation["wl"]
+
+    fig.add_trace(
+        go.Scatter(
+            x=wl,
+            y=simulation["upper"],
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=wl,
+            y=simulation["lower"],
+            mode="lines",
+            fill="tonexty",
+            line=dict(width=0),
+            name="Envelope from all μ(λ) samples",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=wl,
+            y=simulation["mean"],
+            mode="lines",
+            name=f"Simulated, d = {simulation['thickness']:.1f} µm (mean μ)",
+        )
+    )
+
+    fig.update_layout(
+        title="Predicted transmission by thickness",
+        xaxis_title="Wavelength (nm)",
+        yaxis_title=f"Predicted transmission at d = {simulation['thickness']:.1f} µm",
+        hovermode="x unified",
+    )
+    fig.update_xaxes(range=x_range if x_range is not None else [360, 770])
+    if y_range is not None:
+        fig.update_yaxes(range=y_range)
+    return fig
+
+
+def duplicate_parsed_name_warnings(measurement_files):
+    parsed_names = [extract_sample_name(f.name) for f in measurement_files]
+    counts = pd.Series(parsed_names).value_counts()
+    duplicate_counts = counts[counts > 1]
+
+    warnings = []
+    for name, count in duplicate_counts.items():
+        warnings.append({
+            "Type": "Duplicate parsed name",
+            "Sample": name,
+            "Message": f"{count} uploaded files resolve to the same parsed name. Rename files or adjust parsing logic before trusting results.",
+        })
+    return warnings
+
+
+# -------------------------------------------------
+# UI
+# -------------------------------------------------
 st.title("Enhancement Ratio Analyzer")
 st.caption(
     "Upload all measurement files. The app will detect references, match samples to references, suggest thickness values, and run enhancement-ratio analysis."
@@ -348,14 +462,32 @@ with left:
         "1. Drop all measurement files",
         type=["txt", "dat", "csv"],
         accept_multiple_files=True,
-        key="er_measurement_files",
+        key=f"er_measurement_files_{st.session_state.er_uploader_key_counter}",
     )
+
+    if st.button("Clear uploaded files", type="secondary", width="stretch"):
+        reset_app_state()
+        st.rerun()
 
     matching_mode = st.radio(
         "2. Reference matching mode",
         options=["Smart mode", "Manual mode"],
         index=0,
     )
+
+    reference_keywords_text = st.text_input(
+        "Reference keywords",
+        value=st.session_state.er_reference_keywords_text,
+        help="Comma-separated words used to identify reference files. Example: REF, REFERENCE, BLANK, CONTROL",
+    )
+    st.session_state.er_reference_keywords_text = reference_keywords_text
+    reference_keywords = parse_reference_keywords(reference_keywords_text)
+
+    mode_changed = matching_mode != st.session_state.er_last_matching_mode
+    keywords_changed = reference_keywords_text != st.session_state.er_last_reference_keywords_text
+
+    if mode_changed or keywords_changed:
+        st.info("Matching settings changed. Click 'Build / rebuild review table' to apply them. Existing manual edits are not overwritten automatically.")
 
     center_wavelength = st.number_input(
         "3. Center wavelength (nm)",
@@ -370,7 +502,15 @@ with left:
     st.subheader("Optional switches")
     plot_raw = st.toggle("Show raw spectra", value=False)
     solve_thickness = st.toggle("Run thickness normalization", value=False)
-    run_simulation = st.toggle("Run simulation", value=False)
+
+    run_simulation = st.toggle(
+        "Run simulation",
+        value=False,
+        disabled=not solve_thickness,
+        help="Simulation requires thickness normalization because it uses μ(λ).",
+    )
+    if not solve_thickness:
+        run_simulation = False
 
     simulated_thickness = None
     if run_simulation:
@@ -386,10 +526,10 @@ with left:
         "Optional thickness CSV",
         type=["csv"],
         help="Optional CSV with columns: Parsed name, Thickness (µm)",
-        key="er_thickness_csv",
+        key=f"er_thickness_csv_{st.session_state.er_thickness_csv_key_counter}",
     )
 
-    preview = st.button("Preview parsing", type="secondary", width="stretch")
+    preview = st.button("Build / rebuild review table", type="secondary", width="stretch")
     run_analysis = st.button("Run enhancement analysis", type="primary", width="stretch")
 
 with right:
@@ -402,7 +542,11 @@ with right:
         except Exception as e:
             st.error(f"Thickness CSV error: {e}")
 
-    if preview or (measurement_files and st.session_state.er_thickness_editor_df.empty):
+    should_build_preview = preview or (
+        measurement_files and st.session_state.er_thickness_editor_df.empty
+    )
+
+    if should_build_preview:
         if not measurement_files:
             st.warning("Upload the measurement files first.")
         else:
@@ -410,6 +554,7 @@ with right:
                 review_df = build_review_table(
                     measurement_files,
                     manual_thickness_map=manual_thickness_map,
+                    reference_keywords=reference_keywords,
                 )
             else:
                 review_df = build_manual_review_table(
@@ -418,19 +563,27 @@ with right:
                 )
 
             st.session_state.er_review_df = review_df
-            thickness_editor_df = review_df[
-                ["Parsed name", "Type", "Family", "Matched reference", "Thickness (µm)", "Thickness source"]
+            st.session_state.er_thickness_editor_df = review_df[
+                [
+                    "File",
+                    "Parsed name",
+                    "Type",
+                    "Family",
+                    "Matched reference",
+                    "Thickness (µm)",
+                    "Thickness source",
+                ]
             ].copy()
-            st.session_state.er_thickness_editor_df = thickness_editor_df
+            st.session_state.er_last_matching_mode = matching_mode
+            st.session_state.er_last_reference_keywords_text = reference_keywords_text
 
     if not st.session_state.er_thickness_editor_df.empty:
         st.subheader("Editable thickness / reference review")
+        st.caption(
+            "Manual edits in this table are preserved during analysis. Use Type to mark references, and Matched reference to correct pairings."
+        )
 
-        if matching_mode == "Smart mode":
-            disabled_cols = ["Parsed name", "Type", "Family", "Matched reference", "Thickness source"]
-        else:
-            disabled_cols = ["Parsed name", "Family", "Thickness source"]
-
+        disabled_cols = ["File", "Parsed name", "Family", "Thickness source"]
         reference_options = st.session_state.er_thickness_editor_df["Parsed name"].tolist()
 
         edited_df = st.data_editor(
@@ -477,56 +630,96 @@ with right:
 
             if editor_df.empty:
                 if matching_mode == "Smart mode":
-                    editor_df = build_review_table(
+                    generated_review_df = build_review_table(
                         measurement_files,
                         manual_thickness_map=manual_thickness_map,
+                        reference_keywords=reference_keywords,
                     )
                 else:
-                    editor_df = build_manual_review_table(
+                    generated_review_df = build_manual_review_table(
                         measurement_files,
                         manual_thickness_map=manual_thickness_map,
                     )
+                editor_df = generated_review_df[
+                    [
+                        "File",
+                        "Parsed name",
+                        "Type",
+                        "Family",
+                        "Matched reference",
+                        "Thickness (µm)",
+                        "Thickness source",
+                    ]
+                ].copy()
 
-            manual_map = build_thickness_map_from_editor(editor_df)
+            # Important: the edited table is the source of truth.
+            # This prevents Smart mode from overwriting manual reference corrections.
+            review_df = editor_df.copy()
+            review_df["Reference match reason"] = "manual_or_reviewed"
 
-            if matching_mode == "Smart mode":
-                review_df = build_review_table(
-                    measurement_files,
-                    manual_thickness_map=manual_map,
-                )
-            else:
-                review_df = editor_df.copy()
-
-            file_lookup = {extract_sample_name(f.name): f for f in measurement_files}
-            warnings = []
+            warnings = duplicate_parsed_name_warnings(measurement_files)
             details = {}
             results_long = []
             mu_list = []
             sim_wl = None
             d_ref = None
 
+            parsed_uploaded_names = [extract_sample_name(f.name) for f in measurement_files]
+            duplicate_names = pd.Series(parsed_uploaded_names).value_counts()
+            duplicate_names = duplicate_names[duplicate_names > 1]
+
+            if not duplicate_names.empty:
+                # Do not process ambiguous duplicates; otherwise file_lookup would silently overwrite files.
+                st.session_state.er_summary_df = pd.DataFrame()
+                st.session_state.er_review_df = review_df
+                st.session_state.er_warnings_df = pd.DataFrame(warnings)
+                st.session_state.er_details = {
+                    "samples": {},
+                    "simulation": None,
+                    "d_ref": None,
+                    "plot_raw": plot_raw,
+                    "solve_thickness": solve_thickness,
+                    "run_simulation": run_simulation,
+                }
+                st.session_state.er_results_ready = True
+                st.warning("Duplicate parsed names found. Fix filenames or parsing before running analysis.")
+                st.stop()
+
+            file_lookup = {extract_sample_name(f.name): f for f in measurement_files}
+            reference_names_declared = set(
+                review_df[review_df["Type"] == "Reference"]["Parsed name"].tolist()
+            )
+
             if solve_thickness:
                 for _, row in review_df.iterrows():
-                    if row["Type"] == "Sample" and pd.notna(row["Thickness (µm)"]):
-                        t = float(row["Thickness (µm)"])
-                        if d_ref is None or t > d_ref:
-                            d_ref = t
+                    thickness_value = safe_float_or_nan(row.get("Thickness (µm)"))
+                    if row.get("Type") == "Sample" and pd.notna(thickness_value):
+                        if d_ref is None or thickness_value > d_ref:
+                            d_ref = thickness_value
 
             for _, row in review_df.iterrows():
-                if row["Type"] != "Sample":
+                if row.get("Type") != "Sample":
                     continue
 
-                sample_name = row["Parsed name"]
-                ref_name = row["Matched reference"]
-                family = row["Family"]
-                thickness = row["Thickness (µm)"]
-                thickness_source = row["Thickness source"]
+                sample_name = row.get("Parsed name")
+                ref_name = row.get("Matched reference")
+                family = row.get("Family")
+                thickness = safe_float_or_nan(row.get("Thickness (µm)"))
+                thickness_source = row.get("Thickness source")
 
                 if pd.isna(ref_name) or ref_name is None or str(ref_name).strip() == "":
                     warnings.append({
                         "Type": "Missing reference assignment",
                         "Sample": sample_name,
                         "Message": "No reference assigned to this sample.",
+                    })
+                    continue
+
+                if sample_name not in file_lookup:
+                    warnings.append({
+                        "Type": "Missing sample file",
+                        "Sample": sample_name,
+                        "Message": f"Sample file '{sample_name}' was not found among uploaded files.",
                     })
                     continue
 
@@ -537,6 +730,13 @@ with right:
                         "Message": f"Matched reference '{ref_name}' was not found among uploaded files.",
                     })
                     continue
+
+                if ref_name not in reference_names_declared:
+                    warnings.append({
+                        "Type": "Reference points to non-reference row",
+                        "Sample": sample_name,
+                        "Message": f"'{ref_name}' is selected as reference, but its Type is not marked as Reference.",
+                    })
 
                 sample_file = file_lookup[sample_name]
                 ref_file = file_lookup[ref_name]
@@ -564,7 +764,7 @@ with right:
 
                     norm_ratio = None
                     mu_lambda = None
-                    if solve_thickness and pd.notna(thickness) and thickness and d_ref is not None and thickness > 0:
+                    if solve_thickness and pd.notna(thickness) and d_ref is not None and thickness > 0:
                         ratio_clipped = np.clip(ratio, 1e-9, None)
                         norm_ratio = ratio_clipped ** (d_ref / float(thickness))
                         mu_lambda = (-np.log(ratio_clipped)) / float(thickness)
@@ -711,49 +911,105 @@ with right:
                         key="er_graph_mode",
                     )
 
-                    x_min, x_max = st.slider(
-                        "Displayed wavelength range (nm)",
-                        min_value=300,
-                        max_value=900,
-                        value=(360, 770),
-                        step=1,
-                        key="er_graph_range",
+                    ratio_like_graph = graph_mode in [
+                        "Enhancement ratio",
+                        "Thickness-normalized transmission",
+                    ]
+
+                    st.markdown("#### Axis limits")
+                    col_x1, col_x2 = st.columns(2)
+                    with col_x1:
+                        x_min = st.number_input(
+                            "X min",
+                            min_value=200,
+                            max_value=1200,
+                            value=360,
+                            step=1,
+                            key="er_x_min",
+                        )
+                    with col_x2:
+                        x_max = st.number_input(
+                            "X max",
+                            min_value=200,
+                            max_value=1200,
+                            value=770,
+                            step=1,
+                            key="er_x_max",
+                        )
+
+                    manual_y_axis = st.checkbox(
+                        "Use manual Y-axis limits",
+                        value=ratio_like_graph,
+                        key="er_manual_y_axis",
+                        help="Recommended for enhancement-ratio graphs. Leave off for raw spectra unless you know the intensity scale.",
                     )
 
-                    if graph_mode == "Enhancement ratio":
-                        fig = build_plotly_figure(
-                            details_dict=details,
-                            selected_samples=selected_samples,
-                            mode="ratio",
-                            d_ref=d_ref,
-                            x_range=[x_min, x_max],
-                        )
-                    elif graph_mode == "Raw sample spectra":
-                        fig = build_plotly_figure(
-                            details_dict=details,
-                            selected_samples=selected_samples,
-                            mode="raw_sample",
-                            d_ref=d_ref,
-                            x_range=[x_min, x_max],
-                        )
-                    elif graph_mode == "Raw reference spectra":
-                        fig = build_plotly_figure(
-                            details_dict=details,
-                            selected_samples=selected_samples,
-                            mode="raw_reference",
-                            d_ref=d_ref,
-                            x_range=[x_min, x_max],
-                        )
+                    y_range = None
+                    if manual_y_axis:
+                        col_y1, col_y2 = st.columns(2)
+                        with col_y1:
+                            y_min = st.number_input(
+                                "Y min",
+                                value=0.0,
+                                step=0.1,
+                                key="er_y_min",
+                            )
+                        with col_y2:
+                            y_max = st.number_input(
+                                "Y max",
+                                value=2.0,
+                                step=0.1,
+                                key="er_y_max",
+                            )
+                        y_range = [y_min, y_max]
                     else:
-                        fig = build_plotly_figure(
-                            details_dict=details,
-                            selected_samples=selected_samples,
-                            mode="thickness_norm",
-                            d_ref=d_ref,
-                            x_range=[x_min, x_max],
-                        )
+                        y_min, y_max = None, None
 
-                    st.plotly_chart(fig, use_container_width=True)
+                    valid_axes = x_min < x_max and (
+                        not manual_y_axis or y_min < y_max
+                    )
+
+                    if not valid_axes:
+                        st.warning("Axis limits are invalid. X min must be smaller than X max, and Y min must be smaller than Y max.")
+                    else:
+                        if graph_mode == "Enhancement ratio":
+                            fig = build_plotly_figure(
+                                details_dict=details,
+                                selected_samples=selected_samples,
+                                mode="ratio",
+                                d_ref=d_ref,
+                                x_range=[x_min, x_max],
+                                y_range=y_range,
+                            )
+                        elif graph_mode == "Raw sample spectra":
+                            fig = build_plotly_figure(
+                                details_dict=details,
+                                selected_samples=selected_samples,
+                                mode="raw_sample",
+                                d_ref=d_ref,
+                                x_range=[x_min, x_max],
+                                y_range=y_range,
+                            )
+                        elif graph_mode == "Raw reference spectra":
+                            fig = build_plotly_figure(
+                                details_dict=details,
+                                selected_samples=selected_samples,
+                                mode="raw_reference",
+                                d_ref=d_ref,
+                                x_range=[x_min, x_max],
+                                y_range=y_range,
+                            )
+                        else:
+                            fig = build_plotly_figure(
+                                details_dict=details,
+                                selected_samples=selected_samples,
+                                mode="thickness_norm",
+                                d_ref=d_ref,
+                                x_range=[x_min, x_max],
+                                y_range=y_range,
+                            )
+
+                        st.plotly_chart(fig, use_container_width=True)
 
                     st.subheader("Selected sample details")
                     detail_rows = []
@@ -774,27 +1030,53 @@ with right:
             elif simulation is None:
                 st.info("No simulation available. Enable thickness normalization and ensure at least one valid thickness is present.")
             else:
-                fig_sim, ax_sim = plt.subplots(figsize=(8, 4.8))
-                ax_sim.plot(
-                    simulation["wl"],
-                    simulation["mean"],
-                    lw=2,
-                    label=f"Simulated, d = {simulation['thickness']:.1f} µm (mean μ)",
-                )
-                ax_sim.fill_between(
-                    simulation["wl"],
-                    simulation["lower"],
-                    simulation["upper"],
-                    alpha=0.3,
-                    label="Envelope from all μ(λ) samples",
-                )
-                ax_sim.set_xlim(360, 770)
-                ax_sim.set_xlabel("Wavelength (nm)")
-                ax_sim.set_ylabel(f"Predicted transmission at d = {simulation['thickness']:.1f} µm")
-                ax_sim.grid(True, alpha=0.2)
-                ax_sim.legend(loc="best", fontsize=10)
-                ax_sim.set_title("Predicted transmission by thickness")
-                st.pyplot(fig_sim)
+                st.markdown("#### Axis limits")
+                col_sx1, col_sx2, col_sy1, col_sy2 = st.columns(4)
+
+                with col_sx1:
+                    sim_x_min = st.number_input(
+                        "Simulation X min",
+                        min_value=200,
+                        max_value=1200,
+                        value=360,
+                        step=1,
+                        key="er_sim_x_min",
+                    )
+                with col_sx2:
+                    sim_x_max = st.number_input(
+                        "Simulation X max",
+                        min_value=200,
+                        max_value=1200,
+                        value=770,
+                        step=1,
+                        key="er_sim_x_max",
+                    )
+                with col_sy1:
+                    sim_y_min = st.number_input(
+                        "Simulation Y min",
+                        value=0.0,
+                        step=0.1,
+                        key="er_sim_y_min",
+                    )
+                with col_sy2:
+                    sim_y_max = st.number_input(
+                        "Simulation Y max",
+                        value=2.0,
+                        step=0.1,
+                        key="er_sim_y_max",
+                    )
+
+                valid_sim_axes = sim_x_min < sim_x_max and sim_y_min < sim_y_max
+
+                if not valid_sim_axes:
+                    st.warning("Simulation axis limits are invalid.")
+                else:
+                    fig_sim = build_simulation_figure(
+                        simulation,
+                        x_range=[sim_x_min, sim_x_max],
+                        y_range=[sim_y_min, sim_y_max],
+                    )
+                    st.plotly_chart(fig_sim, use_container_width=True)
 
                 sim_df = pd.DataFrame({
                     "Wavelength_nm": simulation["wl"],
@@ -819,4 +1101,4 @@ with right:
                 st.dataframe(warnings_df, width="stretch")
 
     else:
-        st.info("Upload files, preview parsing, optionally edit thickness, then run the analysis.")
+        st.info("Upload files, build the review table, optionally edit thickness/reference assignment, then run the analysis.")
