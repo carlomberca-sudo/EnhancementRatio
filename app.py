@@ -126,7 +126,6 @@ def detect_material_family(name: str):
         if fam in tokens:
             return fam
 
-    # Fallback for compact names like PETREF or PMMAREF.
     for fam in ordered:
         if fam in n:
             return fam
@@ -142,7 +141,6 @@ def extract_sample_name(filename: str):
 
 
 def extract_thickness_from_name(sample_name: str):
-    # Supports names like SAMPLE 1-50-A, SAMPLE 2-100-B, etc.
     wet_to_dry = {50: 11.0, 100: 12.0, 150: 18.0, 200: 38.0, 400: 60.0}
     parts = re.split(r"[-_ ]+", normalize_name(sample_name))
     for part in parts:
@@ -160,7 +158,6 @@ def match_reference(sample_name: str, available_references: list[str]):
     if not available_references:
         return None, "no_references_uploaded"
 
-    # 1. Same material family.
     if family is not None:
         family_matches = [r for r in available_references if detect_material_family(r) == family]
         if len(family_matches) == 1:
@@ -171,7 +168,6 @@ def match_reference(sample_name: str, available_references: list[str]):
                 return a_matches[0], f"matched_family_prefer_A:{family}"
             return family_matches[0], f"multiple_family_matches:{family}"
 
-    # 2. Generic fallback.
     generic_priority = ["LAM", "PET", "EMA", "PMMA", "PE"]
     for fam in generic_priority:
         fam_matches = [r for r in available_references if detect_material_family(r) == fam]
@@ -180,7 +176,6 @@ def match_reference(sample_name: str, available_references: list[str]):
         if len(fam_matches) > 1:
             return fam_matches[0], f"fallback_multiple_family:{fam}"
 
-    # 3. Final fallback.
     return available_references[0], "fallback_first_reference"
 
 
@@ -279,6 +274,9 @@ def make_downloadable_summary(results_long: pd.DataFrame):
         "Mean ratio 400-700",
         "Min ratio 400-700",
         "Max ratio 400-700",
+        "PAR transmission (%)",
+        "Red transmission (%)",
+        "SFQY",
     ]].copy()
     return summary.sort_values(by=["Sample"]).reset_index(drop=True)
 
@@ -289,6 +287,20 @@ def band_stats(wl, ratio, lo=400, hi=700):
         return np.nan, np.nan, np.nan
     vals = ratio[mask]
     return float(np.mean(vals)), float(np.min(vals)), float(np.max(vals))
+
+
+def band_average(wl, y, lo, hi):
+    left = min(lo, hi)
+    right = max(lo, hi)
+    mask = (wl >= left) & (wl <= right)
+    if np.sum(mask) < 2:
+        return np.nan
+    x = wl[mask]
+    vals = y[mask]
+    width = x[-1] - x[0]
+    if abs(width) < 1e-12:
+        return np.nan
+    return float(np.trapezoid(vals, x) / width)
 
 
 def parse_thickness_csv(uploaded_file):
@@ -321,6 +333,9 @@ def build_plotly_figure(
     d_ref=None,
     x_range=None,
     y_range=None,
+    show_metric_bands=False,
+    par_band=(400, 750),
+    red_band=(600, 750),
 ):
     fig = go.Figure()
     title = "Graph"
@@ -369,6 +384,29 @@ def build_plotly_figure(
 
     if mode in ["ratio", "thickness_norm"]:
         fig.add_hline(y=1, line_width=1.5, line_color="black")
+
+    if show_metric_bands:
+        par_left, par_right = min(par_band), max(par_band)
+        red_left, red_right = min(red_band), max(red_band)
+
+        fig.add_vrect(
+            x0=par_left,
+            x1=par_right,
+            fillcolor="lightgreen",
+            opacity=0.12,
+            line_width=0,
+            annotation_text="PAR band",
+            annotation_position="top left",
+        )
+        fig.add_vrect(
+            x0=red_left,
+            x1=red_right,
+            fillcolor="lightcoral",
+            opacity=0.12,
+            line_width=0,
+            annotation_text="Red band",
+            annotation_position="top left",
+        )
 
     fig.update_layout(
         title=title,
@@ -522,6 +560,29 @@ with left:
             step=1.0,
         )
 
+    st.subheader("Advanced optical metrics")
+
+    red_band_min = st.number_input(
+        "Red band min (nm)",
+        min_value=400,
+        max_value=900,
+        value=600,
+        step=1,
+    )
+
+    red_band_max = st.number_input(
+        "Red band max (nm)",
+        min_value=400,
+        max_value=900,
+        value=750,
+        step=1,
+    )
+
+    show_metric_bands = st.toggle(
+        "Show PAR and red integration bands on graphs",
+        value=True,
+    )
+
     thickness_csv = st.file_uploader(
         "Optional thickness CSV",
         type=["csv"],
@@ -652,8 +713,6 @@ with right:
                     ]
                 ].copy()
 
-            # Important: the edited table is the source of truth.
-            # This prevents Smart mode from overwriting manual reference corrections.
             review_df = editor_df.copy()
             review_df["Reference match reason"] = "manual_or_reviewed"
 
@@ -669,7 +728,6 @@ with right:
             duplicate_names = duplicate_names[duplicate_names > 1]
 
             if not duplicate_names.empty:
-                # Do not process ambiguous duplicates; otherwise file_lookup would silently overwrite files.
                 st.session_state.er_summary_df = pd.DataFrame()
                 st.session_state.er_review_df = review_df
                 st.session_state.er_warnings_df = pd.DataFrame(warnings)
@@ -762,6 +820,20 @@ with right:
                     ratio = sample_i / np.clip(ref_i, 1e-12, None)
                     mean_ratio, min_ratio, max_ratio = band_stats(wl, ratio, 400, 700)
 
+                    par_fraction = band_average(wl, ratio, 400, 750)
+                    par_percent = par_fraction * 100 if pd.notna(par_fraction) else np.nan
+
+                    red_fraction = band_average(wl, ratio, red_band_min, red_band_max)
+                    red_percent = red_fraction * 100 if pd.notna(red_fraction) else np.nan
+
+                    sfqy = np.nan
+                    if (
+                        pd.notna(par_fraction)
+                        and pd.notna(red_fraction)
+                        and abs(1.0 - par_fraction) > 1e-12
+                    ):
+                        sfqy = (red_fraction - 1.0) / (1.0 - par_fraction)
+
                     norm_ratio = None
                     mu_lambda = None
                     if solve_thickness and pd.notna(thickness) and d_ref is not None and thickness > 0:
@@ -781,6 +853,9 @@ with right:
                         "Mean ratio 400-700": mean_ratio,
                         "Min ratio 400-700": min_ratio,
                         "Max ratio 400-700": max_ratio,
+                        "PAR transmission (%)": par_percent,
+                        "Red transmission (%)": red_percent,
+                        "SFQY": sfqy,
                     })
 
                     details[sample_name] = {
@@ -794,6 +869,9 @@ with right:
                         "ref_name": ref_name,
                         "family": family,
                         "thickness": thickness,
+                        "par_percent": par_percent,
+                        "red_percent": red_percent,
+                        "sfqy": sfqy,
                     }
 
                 except Exception as e:
@@ -980,6 +1058,9 @@ with right:
                                 d_ref=d_ref,
                                 x_range=[x_min, x_max],
                                 y_range=y_range,
+                                show_metric_bands=show_metric_bands,
+                                par_band=(400, 750),
+                                red_band=(red_band_min, red_band_max),
                             )
                         elif graph_mode == "Raw sample spectra":
                             fig = build_plotly_figure(
@@ -989,6 +1070,9 @@ with right:
                                 d_ref=d_ref,
                                 x_range=[x_min, x_max],
                                 y_range=y_range,
+                                show_metric_bands=show_metric_bands,
+                                par_band=(400, 750),
+                                red_band=(red_band_min, red_band_max),
                             )
                         elif graph_mode == "Raw reference spectra":
                             fig = build_plotly_figure(
@@ -998,6 +1082,9 @@ with right:
                                 d_ref=d_ref,
                                 x_range=[x_min, x_max],
                                 y_range=y_range,
+                                show_metric_bands=show_metric_bands,
+                                par_band=(400, 750),
+                                red_band=(red_band_min, red_band_max),
                             )
                         else:
                             fig = build_plotly_figure(
@@ -1007,9 +1094,12 @@ with right:
                                 d_ref=d_ref,
                                 x_range=[x_min, x_max],
                                 y_range=y_range,
+                                show_metric_bands=show_metric_bands,
+                                par_band=(400, 750),
+                                red_band=(red_band_min, red_band_max),
                             )
 
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
 
                     st.subheader("Selected sample details")
                     detail_rows = []
@@ -1020,6 +1110,9 @@ with right:
                             "Reference": d["ref_name"],
                             "Family": d["family"],
                             "Thickness (µm)": d["thickness"],
+                            "PAR transmission (%)": d["par_percent"],
+                            "Red transmission (%)": d["red_percent"],
+                            "SFQY": d["sfqy"],
                         })
                     st.dataframe(pd.DataFrame(detail_rows), width="stretch")
 
@@ -1076,7 +1169,7 @@ with right:
                         x_range=[sim_x_min, sim_x_max],
                         y_range=[sim_y_min, sim_y_max],
                     )
-                    st.plotly_chart(fig_sim, use_container_width=True)
+                    st.plotly_chart(fig_sim, width="stretch")
 
                 sim_df = pd.DataFrame({
                     "Wavelength_nm": simulation["wl"],
