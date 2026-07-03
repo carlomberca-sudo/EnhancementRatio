@@ -26,9 +26,9 @@ def init_session_state():
         "er_last_reference_keywords_text": "REF, REFERENCE, BLANK, CONTROL",
         "er_last_matching_mode": "Smart mode",
         "er_metric_bands_df": pd.DataFrame({
-            "Metric name": ["PAR", "Red"],
-            "Min nm": [400, 600],
-            "Max nm": [750, 750],
+            "Metric name": ["UV", "Blue", "Green", "Red", "PAR", "Scattering"],
+            "Min nm": [360, 400, 500, 600, 400, 750],
+            "Max nm": [400, 500, 600, 750, 750, 760],
         }),
         "er_last_analysis_signature": None,
     }
