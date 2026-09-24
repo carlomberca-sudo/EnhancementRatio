@@ -1,2 +1,1 @@
-# PLQY-SolarFoil
-Second version of PLQY App. Batch Analysis 
+Tool for analysing spectral enhancement relative to a reference sample, automatically calculating enhancement ratios across defined wavelength regions and generating comparable outputs for multiple measurements.
